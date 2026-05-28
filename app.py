@@ -67,6 +67,15 @@ def get_info():
     if not url:
         return jsonify({'error': 'URL is empty'}), 400
         
+    # Meta Fail-Fast Check: Instagram & Facebook block datacenter IPs by default.
+    # If the user tries to download Meta links and has not set up a PROXY_URL,
+    # fail instantly with a beautiful, educational error message rather than hanging!
+    is_meta = 'instagram.com' in url.lower() or 'facebook.com' in url.lower() or 'fb.watch' in url.lower()
+    if is_meta and not proxy_url:
+        return jsonify({
+            'error': 'Instagram & Facebook block cloud servers by default. To unlock Instagram/Facebook downloads on your phone 24/7, you just need to add a secure PROXY_URL in your Render settings (using a cheap $1.50 residential proxy).'
+        }), 400
+        
     # Get centralized yt-dlp options
     ydl_opts = get_ydl_opts()
     
