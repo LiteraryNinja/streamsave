@@ -68,12 +68,20 @@ def fetch_cobalt_stream(video_url, quality="720"):
                 if res.status_code == 200:
                     data = res.json()
                     
-                    # Handle direct stream download responses
-                    if data.get('status') in ['stream', 'redirect']:
+                    # Handle direct stream download responses (V10 tunnel/redirect or V7 stream)
+                    if data.get('status') in ['tunnel', 'redirect', 'stream']:
                         return {
                             'url': data.get('url'),
                             'filename': data.get('filename', 'video.mp4')
                         }
+                    # Handle local-processing formats
+                    elif data.get('status') == 'local-processing':
+                        tunnels = data.get('tunnel', [])
+                        if tunnels:
+                            return {
+                                'url': tunnels[0],
+                                'filename': data.get('filename', 'video.mp4')
+                            }
                     # Handle galleries/picker lists (like TikTok multi-images)
                     elif data.get('status') == 'picker':
                         picker_items = data.get('picker', [])
