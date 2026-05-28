@@ -29,6 +29,9 @@ def get_ydl_opts(format_id=None, temp_filepath_template=None, is_download=False)
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        'ignoreerrors': True,
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios']
