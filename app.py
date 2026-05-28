@@ -31,7 +31,6 @@ def get_ydl_opts(format_id=None, temp_filepath_template=None, is_download=False)
         'no_warnings': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'ignoreerrors': True,
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios']
@@ -193,6 +192,8 @@ def get_info():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError("No video details returned. The video might be private, restricted, or temporarily unavailable.")
             
             # Extract basic metadata
             title = info.get('title', 'Unknown Title')
