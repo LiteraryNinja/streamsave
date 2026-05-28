@@ -1,101 +1,57 @@
 from flask import Flask, request, jsonify, send_from_directory, Response
 import os
 import requests
+import yt_dlp
 import re
 import urllib.parse
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
-def get_working_cobalt_instances():
-    """
-    Queries the live community tracker to get the highest-scoring active
-    public Cobalt servers. Falls back to a robust pool if the tracker is down.
-    """
-    fallbacks = [
-        "https://api.kuko.moe/api",
-        "https://cobalt.api.ryuko.space",
-        "https://cobalt.hyper.rip",
-        "https://cobalt.q14.link",
-        "https://cobalt.wuk.sh"
-    ]
-    
-    tracker_url = "https://instances.hyper.lol/api/instances"
-    try:
-        # This will resolve and fetch perfectly on Render's cloud servers
-        res = requests.get(tracker_url, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            # Sort instances by their performance score in descending order
-            sorted_instances = sorted(data, key=lambda x: x.get('score', 0), reverse=True)
-            # Filter for up/active instances
-            urls = [inst['url'] for inst in sorted_instances if inst.get('url')]
-            if urls:
-                return urls
-    except Exception as e:
-        print(f"Failed to fetch from live tracker: {e}. Falling back to default pool.")
-        
-    return fallbacks
+# Securely extract cookies from environment variables on startup
+cookies_text = os.environ.get('COOKIES_TEXT')
+cookies_path = None
+if cookies_text:
+    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+    cookies_path = os.path.join(temp_dir, 'cookies.txt')
+    with open(cookies_path, 'w', encoding='utf-8') as f:
+        f.write(cookies_text)
 
-def fetch_cobalt_stream(video_url, quality="720"):
+# Extract proxy configuration if available
+proxy_url = os.environ.get('PROXY_URL')
+
+def get_ydl_opts(format_id=None, temp_filepath_template=None, is_download=False):
     """
-    Iterates through active public servers, executing failover in case of 
-    errors or rate limits, and returns a verified stream URL.
+    Central helper to generate consistent yt-dlp configurations.
+    Injects mobile user-agents, secure login cookies, and proxies dynamically.
     """
-    instances = get_working_cobalt_instances()
-    
-    payload = {
-        "url": video_url,
-        "videoQuality": quality,
-        "downloadMode": "auto"
-    }
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios']
+            }
+        }
     }
     
-    for api_url in instances:
-        api_url = api_url.rstrip('/')
+    if is_download:
+        ydl_opts['format'] = format_id if format_id else 'best'
+        ydl_opts['outtmpl'] = temp_filepath_template
+    else:
+        ydl_opts['skip_download'] = True
+        ydl_opts['extract_flat'] = False
         
-        # Self-hosted V10 servers support root POST; older versions use /api/json
-        endpoints_to_try = [api_url]
-        if not api_url.endswith('/api/json'):
-            endpoints_to_try.append(f"{api_url}/api/json")
-            
-        for endpoint in endpoints_to_try:
-            try:
-                # Fast timeout (6 seconds) to failover quickly if a server is unresponsive
-                res = requests.post(endpoint, headers=headers, json=payload, timeout=6)
-                if res.status_code == 200:
-                    data = res.json()
-                    
-                    # Handle direct stream download responses (V10 tunnel/redirect or V7 stream)
-                    if data.get('status') in ['tunnel', 'redirect', 'stream']:
-                        return {
-                            'url': data.get('url'),
-                            'filename': data.get('filename', 'video.mp4')
-                        }
-                    # Handle local-processing formats
-                    elif data.get('status') == 'local-processing':
-                        tunnels = data.get('tunnel', [])
-                        if tunnels:
-                            return {
-                                'url': tunnels[0],
-                                'filename': data.get('filename', 'video.mp4')
-                            }
-                    # Handle galleries/picker lists (like TikTok multi-images)
-                    elif data.get('status') == 'picker':
-                        picker_items = data.get('picker', [])
-                        if picker_items:
-                            first_item = picker_items[0]
-                            return {
-                                'url': first_item.get('url'),
-                                'filename': data.get('filename', 'video.mp4')
-                            }
-            except Exception as e:
-                # Silently failover to the next endpoint
-                continue
-                
-    return None
+    # Inject secure cookies if available
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+        
+    # Inject routing proxies if available
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        
+    return ydl_opts
 
 @app.route('/')
 def index():
@@ -111,97 +67,203 @@ def get_info():
     if not url:
         return jsonify({'error': 'URL is empty'}), 400
         
+    # Get centralized yt-dlp options
+    ydl_opts = get_ydl_opts()
+    
     try:
-        # Call our robust failover download engine
-        result = fetch_cobalt_stream(url)
-        if not result:
-            return jsonify({'error': 'Unable to process download. The video might be private or all cloud servers are temporarily busy. Please try again.'}), 500
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
             
-        # Clean up a human-readable title from the returned filename
-        filename = result.get('filename', 'video.mp4')
-        title = os.path.splitext(filename)[0].replace('_', ' ').replace('-', ' ').strip()
-        if not title:
-            title = 'Downloaded Video'
+            # Extract basic metadata
+            title = info.get('title', 'Unknown Title')
+            duration = info.get('duration') # in seconds
+            thumbnail = info.get('thumbnail') or (info.get('thumbnails')[0]['url'] if info.get('thumbnails') else None)
+            uploader = info.get('uploader') or info.get('channel') or 'Unknown Source'
+            platform = info.get('extractor_key', 'Generic')
             
-        # Determine platform signature for aesthetics
-        platform = 'Video'
-        lower_url = url.lower()
-        if 'youtube' in lower_url or 'youtu.be' in lower_url:
-            platform = 'YouTube'
-        elif 'tiktok' in lower_url:
-            platform = 'TikTok'
-        elif 'instagram' in lower_url:
-            platform = 'Instagram'
-        elif 'facebook' in lower_url or 'fb.watch' in lower_url:
-            platform = 'Facebook'
+            # Extract formats that contain both video AND audio
+            formats_list = []
+            raw_formats = info.get('formats', [])
             
-        return jsonify({
-            'title': title,
-            'duration': None,
-            'thumbnail': 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=500&auto=format&fit=crop&q=60',
-            'uploader': 'Cloud Engine',
-            'platform': platform,
-            'formats': [{
-                'format_id': 'best',
-                'ext': os.path.splitext(filename)[1].replace('.', '') if '.' in filename else 'mp4',
-                'resolution': 'Best Quality',
-                'filesize': None,
-                'format_note': 'High Definition',
-                'url': result.get('url')
-            }],
-            'original_url': url
-        })
+            for f in raw_formats:
+                vcodec = f.get('vcodec', 'none')
+                acodec = f.get('acodec', 'none')
+                
+                # Check for both video and audio streams
+                if vcodec != 'none' and acodec != 'none':
+                    height = f.get('height')
+                    width = f.get('width')
+                    res_label = f"{height}p" if height else (f"{width}x" if width else "Unknown")
+                    
+                    filesize = f.get('filesize') or f.get('filesize_approx')
+                    filesize_mb = round(filesize / (1024 * 1024), 1) if filesize else None
+                    
+                    formats_list.append({
+                        'format_id': f.get('format_id'),
+                        'ext': f.get('ext', 'mp4'),
+                        'resolution': res_label,
+                        'filesize': filesize_mb,
+                        'format_note': f.get('format_note') or f.get('resolution') or '',
+                        'url': f.get('url')
+                    })
+            
+            # If no formats with both audio & video were found (e.g. simple direct link),
+            # use top-level direct URL
+            if not formats_list and info.get('url'):
+                formats_list.append({
+                    'format_id': 'best',
+                    'ext': info.get('ext', 'mp4'),
+                    'resolution': 'Best Quality',
+                    'filesize': None,
+                    'format_note': 'Direct Stream',
+                    'url': info.get('url')
+                })
+            
+            # Sort formats by resolution height
+            def get_height(fmt):
+                res = fmt['resolution']
+                match = re.search(r'(\d+)p', res)
+                return int(match.group(1)) if match else 0
+            
+            formats_list = sorted(formats_list, key=get_height, reverse=True)
+            
+            # Deduplicate formats by resolution to keep UI neat
+            seen_resolutions = set()
+            deduped_formats = []
+            for fmt in formats_list:
+                res = fmt['resolution']
+                if res not in seen_resolutions:
+                    seen_resolutions.add(res)
+                    deduped_formats.append(fmt)
+            
+            return jsonify({
+                'title': title,
+                'duration': duration,
+                'thumbnail': thumbnail,
+                'uploader': uploader,
+                'platform': platform,
+                'formats': deduped_formats,
+                'original_url': url
+            })
             
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        error_msg = str(e)
+        if 'Unsupported URL' in error_msg:
+            error_msg = 'Unsupported website or invalid link. Please double-check your link.'
+        elif 'Sign in' in error_msg:
+            error_msg = 'This video requires a sign-in or is private.'
+        return jsonify({'error': error_msg}), 500
 
 @app.route('/api/download')
 def download_video():
-    video_url = request.args.get('url')
+    original_url = request.args.get('original_url')
+    format_id = request.args.get('format_id')
+    direct_url = request.args.get('url')
     filename = request.args.get('title', 'video')
     ext = request.args.get('ext', 'mp4')
     
-    if not video_url:
-        return 'Missing video URL parameter', 400
+    if not original_url and not direct_url:
+        return 'Missing video URL parameters', 400
         
-    video_url = urllib.parse.unquote(video_url)
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    # Set up a secure temporary downloads folder in our workspace
+    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+        
+    import uuid
+    unique_id = str(uuid.uuid4())
+    temp_filepath_template = os.path.join(temp_dir, f"{unique_id}_%(id)s.%(ext)s")
     
     try:
-        # Secure filename formatting
+        if original_url:
+            original_url = urllib.parse.unquote(original_url)
+            
+            # Get centralized download options
+            ydl_opts = get_ydl_opts(format_id=format_id, temp_filepath_template=temp_filepath_template, is_download=True)
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([original_url])
+                
+            # Find the actual downloaded file (handling arbitrary extensions)
+            downloaded_file = None
+            for file in os.listdir(temp_dir):
+                if file.startswith(unique_id):
+                    downloaded_file = os.path.join(temp_dir, file)
+                    break
+                    
+            if not downloaded_file or not os.path.exists(downloaded_file):
+                return 'Failed to process media file locally', 500
+        else:
+            # Fallback for direct MP4 links
+            direct_url = urllib.parse.unquote(direct_url)
+            downloaded_file = os.path.join(temp_dir, f"{unique_id}.{ext}")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            # Inject proxies for fallback direct URL requests if proxy is active
+            req_proxies = None
+            if proxy_url:
+                req_proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url
+                }
+                
+            req = requests.get(direct_url, headers=headers, proxies=req_proxies, stream=True, timeout=30)
+            req.raise_for_status()
+            with open(downloaded_file, 'wb') as f:
+                for chunk in req.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+                        
+        # Extract metadata for transfer
+        content_size = os.path.getsize(downloaded_file)
+        actual_ext = os.path.splitext(downloaded_file)[1].replace('.', '')
+        if not actual_ext:
+            actual_ext = ext
+            
         safe_filename = re.sub(r'[^\w\s-]', '', filename).strip()
         safe_filename = re.sub(r'[-\s]+', '_', safe_filename)
         if not safe_filename:
             safe_filename = 'video'
-        full_filename = f"{safe_filename}.{ext}"
+        full_filename = f"{safe_filename}.{actual_ext}"
         
-        # Proxy-stream the direct media file securely from the Cobalt server to bypass CORS
-        req = requests.get(video_url, headers=headers, stream=True, timeout=45)
-        req.raise_for_status()
-        
+        # Stream chunks back to client browser
         def generate():
-            for chunk in req.iter_content(chunk_size=32768):
-                if chunk:
-                    yield chunk
-                    
+            try:
+                with open(downloaded_file, 'rb') as f:
+                    while True:
+                        chunk = f.read(32768)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                # Guarantee temporary file is deleted immediately after transfer finishes or cancels
+                if downloaded_file and os.path.exists(downloaded_file):
+                    try:
+                        os.remove(downloaded_file)
+                    except Exception as err:
+                        print(f"Error removing temp file: {err}")
+                        
         response_headers = {
             'Content-Disposition': f'attachment; filename="{full_filename}"',
-            'Content-Type': req.headers.get('Content-Type', 'video/mp4'),
+            'Content-Type': 'video/mp4' if actual_ext == 'mp4' else f'video/{actual_ext}',
+            'Content-Length': str(content_size)
         }
         
-        # Forward Content-Length so the browser shows a perfectly accurate progress bar
-        content_length = req.headers.get('Content-Length')
-        if content_length:
-            response_headers['Content-Length'] = content_length
-            
         return Response(generate(), headers=response_headers)
         
     except Exception as e:
         import traceback
         traceback.print_exc()
+        
+        # Cleanup any partial files in case of failures before streaming starts
+        for file in os.listdir(temp_dir):
+            if file.startswith(unique_id):
+                try:
+                    os.remove(os.path.join(temp_dir, file))
+                except:
+                    pass
         return f"Failed to download video stream: {str(e)}", 500
 
 if __name__ == '__main__':
