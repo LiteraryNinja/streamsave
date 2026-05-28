@@ -7,6 +7,52 @@ import urllib.parse
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
+# Securely extract cookies from environment variables on startup
+cookies_text = os.environ.get('COOKIES_TEXT')
+cookies_path = None
+if cookies_text:
+    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+    cookies_path = os.path.join(temp_dir, 'cookies.txt')
+    with open(cookies_path, 'w', encoding='utf-8') as f:
+        f.write(cookies_text)
+
+# Extract proxy configuration if available
+proxy_url = os.environ.get('PROXY_URL')
+
+def get_ydl_opts(format_id=None, temp_filepath_template=None, is_download=False):
+    """
+    Central helper to generate consistent yt-dlp configurations.
+    Injects mobile user-agents, secure login cookies, and proxies dynamically.
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios']
+            }
+        }
+    }
+    
+    if is_download:
+        ydl_opts['format'] = format_id if format_id else 'best'
+        ydl_opts['outtmpl'] = temp_filepath_template
+    else:
+        ydl_opts['skip_download'] = True
+        ydl_opts['extract_flat'] = False
+        
+    # Inject secure cookies if available
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+        
+    # Inject routing proxies if available
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        
+    return ydl_opts
+
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
@@ -21,17 +67,8 @@ def get_info():
     if not url:
         return jsonify({'error': 'URL is empty'}), 400
         
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': False,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios']
-            }
-        }
-    }
+    # Get centralized yt-dlp options
+    ydl_opts = get_ydl_opts()
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -111,7 +148,6 @@ def get_info():
             
     except Exception as e:
         error_msg = str(e)
-        # Simplify common yt-dlp error messages for user-friendly display
         if 'Unsupported URL' in error_msg:
             error_msg = 'Unsupported website or invalid link. Please double-check your link.'
         elif 'Sign in' in error_msg:
@@ -142,18 +178,8 @@ def download_video():
         if original_url:
             original_url = urllib.parse.unquote(original_url)
             
-            # Run yt-dlp natively on the backend to download the media securely
-            ydl_opts = {
-                'format': format_id if format_id else 'best',
-                'outtmpl': temp_filepath_template,
-                'quiet': True,
-                'no_warnings': True,
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'ios']
-                    }
-                }
-            }
+            # Get centralized download options
+            ydl_opts = get_ydl_opts(format_id=format_id, temp_filepath_template=temp_filepath_template, is_download=True)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([original_url])
@@ -175,7 +201,15 @@ def download_video():
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
-            req = requests.get(direct_url, headers=headers, stream=True, timeout=30)
+            # Inject proxies for fallback direct URL requests if proxy is active
+            req_proxies = None
+            if proxy_url:
+                req_proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url
+                }
+                
+            req = requests.get(direct_url, headers=headers, proxies=req_proxies, stream=True, timeout=30)
             req.raise_for_status()
             with open(downloaded_file, 'wb') as f:
                 for chunk in req.iter_content(chunk_size=32768):
