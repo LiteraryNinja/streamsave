@@ -53,6 +53,90 @@ def get_ydl_opts(format_id=None, temp_filepath_template=None, is_download=False)
         
     return ydl_opts
 
+def get_working_cobalt_instances():
+    """
+    Queries the live community tracker to get active public Cobalt servers.
+    Falls back to a robust pool if the tracker is down.
+    """
+    fallbacks = [
+        "https://api.kuko.moe/api",
+        "https://cobalt.api.ryuko.space/api",
+        "https://cobalt.hyper.rip/api",
+        "https://cobalt.q14.link/api",
+        "https://cobalt.wuk.sh/api"
+    ]
+    tracker_url = "https://instances.hyper.lol/api/instances"
+    try:
+        res = requests.get(tracker_url, timeout=3)
+        if res.status_code == 200:
+            data = res.json()
+            sorted_instances = sorted(data, key=lambda x: x.get('score', 0), reverse=True)
+            urls = [inst['url'] for inst in sorted_instances if inst.get('url')]
+            if urls:
+                processed_urls = []
+                for u in urls:
+                    u = u.rstrip('/')
+                    if not u.endswith('/api'):
+                        processed_urls.append(f"{u}/api")
+                    else:
+                        processed_urls.append(u)
+                return processed_urls
+    except Exception as e:
+        print(f"Failed to fetch from live tracker: {e}. Falling back to default pool.")
+    return fallbacks
+
+def fetch_cobalt_stream(video_url, quality="720"):
+    """
+    Queries community Cobalt servers in case of datacenter IP blocks, returning
+    a direct download stream.
+    """
+    instances = get_working_cobalt_instances()
+    payload = {
+        "url": video_url,
+        "videoQuality": quality,
+        "downloadMode": "auto"
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    for api_url in instances:
+        api_url = api_url.rstrip('/')
+        endpoints_to_try = [api_url]
+        if api_url.endswith('/api'):
+            endpoints_to_try.append(api_url[:-4])
+        else:
+            endpoints_to_try.append(f"{api_url}/api")
+            
+        for endpoint in endpoints_to_try:
+            try:
+                res = requests.post(endpoint, headers=headers, json=payload, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    status = data.get('status')
+                    if status in ['tunnel', 'redirect', 'stream']:
+                        return {
+                            'url': data.get('url'),
+                            'filename': data.get('filename', 'video.mp4')
+                        }
+                    elif status == 'local-processing':
+                        tunnels = data.get('tunnel', [])
+                        if tunnels:
+                            return {
+                                'url': tunnels[0],
+                                'filename': data.get('filename', 'video.mp4')
+                            }
+                    elif status == 'picker':
+                        picker_items = data.get('picker', [])
+                        if picker_items:
+                            return {
+                                'url': picker_items[0].get('url'),
+                                'filename': data.get('filename', 'video.mp4')
+                            }
+            except Exception:
+                continue
+    return None
+
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
@@ -67,15 +151,39 @@ def get_info():
     if not url:
         return jsonify({'error': 'URL is empty'}), 400
         
-    # Meta Fail-Fast Check: Instagram & Facebook block datacenter IPs by default.
-    # If the user tries to download Meta links and has not set up a PROXY_URL,
-    # fail instantly with a beautiful, educational error message rather than hanging!
+    # Meta Fallback Check: Instagram & Facebook block datacenter IPs by default.
+    # If no PROXY_URL is set, silently try public Cobalt fallback instances first.
+    # If all public fallbacks fail, only then show the educational warning toast.
     is_meta = 'instagram.com' in url.lower() or 'facebook.com' in url.lower() or 'fb.watch' in url.lower()
     if is_meta and not proxy_url:
-        return jsonify({
-            'error': 'Instagram & Facebook block cloud servers by default. To unlock Instagram/Facebook downloads on your phone 24/7, you just need to add a secure PROXY_URL in your Render settings (using a cheap $1.50 residential proxy).'
-        }), 400
-        
+        print(f"Meta link detected with no PROXY_URL. Running Cobalt fallback for: {url}")
+        cobalt_result = fetch_cobalt_stream(url)
+        if cobalt_result:
+            filename = cobalt_result.get('filename', 'video.mp4')
+            title = os.path.splitext(filename)[0].replace('_', ' ').replace('-', ' ').strip()
+            if not title:
+                title = 'Instagram Video'
+            return jsonify({
+                'title': title,
+                'duration': None,
+                'thumbnail': 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=500&auto=format&fit=crop&q=60',
+                'uploader': 'Cloud Downloader',
+                'platform': 'Instagram',
+                'formats': [{
+                    'format_id': 'best',
+                    'ext': 'mp4',
+                    'resolution': 'Best Quality',
+                    'filesize': None,
+                    'format_note': 'Direct Stream',
+                    'url': cobalt_result['url']
+                }],
+                'original_url': url
+            })
+        else:
+            return jsonify({
+                'error': 'Instagram & Facebook block cloud servers by default. To unlock Instagram/Facebook downloads on your phone 24/7, you just need to add a secure PROXY_URL in your Render settings (using a cheap $1.50 residential proxy).'
+            }), 400
+            
     # Get centralized yt-dlp options
     ydl_opts = get_ydl_opts()
     

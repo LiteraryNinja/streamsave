@@ -574,7 +574,7 @@ body {
     max-width: 420px;
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
     display: flex;
-    align-items: center;
+    align-items: flex-start; /* Aligns icon with the top line of text */
     gap: 12px;
     animation: slideIn 0.35s cubic-bezier(0.25, 0.8, 0.25, 1) forwards;
 }
@@ -597,6 +597,7 @@ body {
     font-size: 0.9rem;
     font-weight: 400;
     line-height: 1.4;
+    padding-top: 1px; /* Vertically aligns text perfectly with the icon */
 }
 
 .toast-close {
@@ -607,6 +608,8 @@ body {
     cursor: pointer;
     display: flex;
     align-items: center;
+    align-self: flex-start; /* Aligns close button with the top line of text */
+    padding-top: 2px;
 }
 
 .toast-close svg {
